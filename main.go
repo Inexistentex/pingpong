@@ -2,56 +2,40 @@ package main
 
 import (
     "bytes"
-    "crypto/rand"
+  
     "encoding/json"
     "fmt"
     "math/big"
     "os"
+    "crypto/rand"    // Adicione esta linha
+    "math"       // Adicione esta linha
     "runtime"
     "strings"
     "sync"
     "sync/atomic"
     "time"
     "btchunt/wif"
+    "btchunt/bloom"
+)
+
+
+
+const (
+    minBallSize     = 1000     // Tamanho mínimo da bola de verificação
+    maxBallSize     = 10000    // Tamanho máximo da bola de verificação
+    defaultBallSize = 5000     // Tamanho inicial da bola de verificação
 )
 
 const (
-    minBallSize     = 50000     // Aumentado para cobrir mais espaço por verificação
-    maxBallSize     = 1000000   // Mantido alto para permitir saltos maiores
-    defaultBallSize = 100000    // Aumentado para melhor cobertura inicial
+    initialVelocity     = 0.4    // Velocidade inicial
+    baseEnergyLoss      = 0.015  // Perda de energia base nas colisões
+    adaptiveEnergyLoss  = 0.06   // Perda de energia adaptativa
+    minVelocity         = 0.008  // Velocidade mínima permitida
+    maxVelocity         = 0.7    // Velocidade máxima permitida
+    momentumFactor      = 0.25   // Fator de conservação de momentum
+    adaptiveRangeFactor = 0.2    // Fator de adaptação do range
 )
-
-const (
-    initialVelocity     = 0.5    // Aumentado para cobrir mais espaço rapidamente
-    baseEnergyLoss      = 0.02   // Reduzido para manter momentum por mais tempo
-    adaptiveEnergyLoss  = 0.008  // Reduzido para ajustes mais suaves
-    minVelocity         = 0.005  // Aumentado para evitar busca muito localizada
-    maxVelocity         = 0.7    // Aumentado para permitir saltos maiores
-    momentumFactor      = 0.25   // Aumentado para maior persistência na direção
-    adaptiveRangeFactor = 0.2    // Aumentado para adaptação mais rápida
-)
-
-// Adicione estas novas estruturas e variáveis
-type ProgressBar struct {
-    totalSize   *big.Int
-    segments    int
-    hits        []uint64    // Corrigido para uint64
-    maxHits     uint64
-    mu          sync.Mutex
-}
-
 var base58Alphabet = []byte("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
-
-const progressBarWidth = 100 // Largura da barra de progresso
-
-func NewProgressBar(min, max *big.Int) *ProgressBar {
-    return &ProgressBar{
-        totalSize: new(big.Int).Sub(max, min),
-        segments:  progressBarWidth,
-        hits:      make([]uint64, progressBarWidth), // Corrigido para uint64
-        maxHits:   0,
-    }
-}
 
 // RangeConfig define a estrutura do arquivo JSON
 type RangeConfig struct {
@@ -62,76 +46,13 @@ type RangeConfig struct {
     } `json:"ranges"`
 }
 
-func (pb *ProgressBar) updateHit(position *big.Int, rangeMin *big.Int) {
-    pb.mu.Lock()
-    defer pb.mu.Unlock()
-
-    // Calcula a posição relativa no range
-    relativePos := new(big.Int).Sub(position, rangeMin)
-    totalSize := pb.totalSize
-    
-    // Calcula o índice do segmento
-    segmentFloat := new(big.Float).Quo(
-        new(big.Float).SetInt(relativePos),
-        new(big.Float).SetInt(totalSize),
-    )
-    segmentFloat = new(big.Float).Mul(segmentFloat, new(big.Float).SetInt64(int64(pb.segments)))
-    
-    segment, _ := segmentFloat.Int64()
-    
-    // Garante que o índice está dentro dos limites
-    if segment >= 0 && segment < int64(pb.segments) {
-        // Incrementa o contador de hits para este segmento
-        pb.hits[segment]++
-        
-        // Atualiza o máximo de hits se necessário
-        if pb.hits[segment] > pb.maxHits {
-            pb.maxHits = pb.hits[segment]
-        }
-    }
-}
-
-
-func (pb *ProgressBar) render() string {
-    pb.mu.Lock()
-    defer pb.mu.Unlock()
-
-    var buffer strings.Builder
-    buffer.WriteString("[")
-
-    // Ajusta os limiares para uma progressão mais gradual
-    for _, hits := range pb.hits {
-        if hits == 0 {
-            buffer.WriteString(" ")
-            continue
-        }
-
-        // Calcula a proporção de hits em relação ao máximo
-        ratio := float64(hits) / float64(pb.maxHits)
-        
-        // Novos limiares mais graduais
-        switch {
-        case ratio < 0.25:
-            buffer.WriteString("░") // Muito baixo
-        case ratio < 0.50:
-            buffer.WriteString("▒") // Baixo
-        case ratio < 0.75:
-            buffer.WriteString("▓") // Médio
-        default:
-            buffer.WriteString("█") // Alto
-        }
-    }
-    
-    buffer.WriteString("]")
-    return buffer.String()
-}
-
 
 // Range defines the search interval
 type Range struct {
     Min    *big.Int
     Max    *big.Int
     Status []byte // Modificado para armazenar diretamente o hash160
+    Filter *bloomfilter.BloomFilter
 }
 
 // Stats mantém as estatísticas da busca
@@ -139,8 +60,10 @@ type Stats struct {
     keysChecked     uint64
     startTime       time.Time
     lastSpeedUpdate time.Time
-    progressBar     *ProgressBar
+    searchRange     Range
 }
+
+
 
 // BallRange define o tamanho da "bola" de verificação
 type BallRange struct {
@@ -162,7 +85,12 @@ type JumpStrategy struct {
     coverage      map[string]uint64
     momentum      float64
     mu            sync.Mutex
+    height        float64   // Altura atual da trajetória
+    groundTouches int      // Contador de toques no chão
+    lastBounce    time.Time // Tempo do último toque
+    energyLevel   float64   // Nível de energia atual
 }
+
 
 
 // base58Decode decodes Base58 data
@@ -262,13 +190,20 @@ func LoadRangesFromJSON(filename string) ([]Range, error) {
             return nil, fmt.Errorf("invalid max value: %s", r.Max)
         }
 
-        // Converte o endereço diretamente para hash160
+        // Converte o endereço para hash160
         hash160 := addressToHash160(r.Status)
+
+        // Inicializa o Bloom Filter
+        expectedItems := uint(500 * 1024 * 1024 * 8 / 12)
+        falsePositiveRate := 0.0000001
+        bf := bloomfilter.NewBloomFilter(expectedItems, falsePositiveRate)
+        bf.Add(hash160)
 
         ranges[i] = Range{
             Min:    min,
             Max:    max,
             Status: hash160,
+            Filter: bf,
         }
     }
 
@@ -277,58 +212,88 @@ func LoadRangesFromJSON(filename string) ([]Range, error) {
 
 // PrintProgress imprime as estatísticas de progresso
 func PrintProgress(stats *Stats) {
-    // Limpa a tela
-    fmt.Print("\033[2J\033[H")
-    
-    // Imprime o cabeçalho inicial uma única vez
-    header := fmt.Sprintf("Searching range 1:\n" +
-        "Target hash160: 2f396b29b27324300d0c59b17c3abc1835bd3dbb\n" +
-        "Target Address Hash160: 2f396b29b27324300d0c59b17c3abc1835bd3dbb\n" +
-        "Range Min (hex): 1000000\n" +
-        "Range Max (hex): 1ffffff\n" +
-        "Range Size (keys): 16777216\n" +
-        "Using %d CPU cores\n", runtime.NumCPU())
-    
-    fmt.Print(header)
-    
-    // Posição para começar a atualizar as estatísticas
-    basePosition := 8
-    
+    const barWidth = 100
+
     for {
-        time.Sleep(time.Second)
-        
-        // Move o cursor para a posição base e limpa até o final da tela
-        fmt.Printf("\033[%d;0H\033[J", basePosition)
-        
-        keysChecked := atomic.LoadUint64(&stats.keysChecked)
-        duration := time.Since(stats.startTime)
-        keysPerSecond := float64(keysChecked) / duration.Seconds()
-        
-        // Atualiza as estatísticas
-        fmt.Printf("Keys Checked: %d | Keys/sec: %.2f | Time Elapsed: %s\n", 
-            keysChecked, 
-            keysPerSecond, 
-            duration.Round(time.Second))
-        
-        // Atualiza a barra de progresso
-        fmt.Printf("Progress: %s\n", stats.progressBar.render())
-        fmt.Printf("Legend: ░ (<25%%) ▒ (<50%%) ▓ (<75%%) █ (>75%%)")
+        select {
+        case <-done:
+            return
+        default:
+            time.Sleep(5 * time.Second)
+            fmt.Print("\033[H\033[2J")
+
+            rangeSize := new(big.Int).Sub(stats.searchRange.Max, stats.searchRange.Min)
+            
+            keysChecked := atomic.LoadUint64(&stats.keysChecked)
+            duration := time.Since(stats.startTime)
+            keysPerSecond := float64(keysChecked) / duration.Seconds()
+
+            globalStatus.mu.Lock()
+            currentPos := new(big.Int).Set(globalStatus.currentPosition)
+            globalStatus.mu.Unlock()
+
+            progress := new(big.Float).Quo(
+                new(big.Float).SetInt(new(big.Int).Sub(currentPos, stats.searchRange.Min)),
+                new(big.Float).SetInt(rangeSize),
+            )
+            percentage, _ := progress.Float64()
+            percentage *= 100
+
+            remainingKeys := new(big.Int).Sub(stats.searchRange.Max, currentPos)
+            remainingKeysFloat := new(big.Float).SetInt(remainingKeys)
+            remainingKeysVal, _ := remainingKeysFloat.Float64()
+            estimatedTimeRemaining := remainingKeysVal / keysPerSecond
+
+            progressBar := generateProgressBar(
+                stats.searchRange.Min,
+                stats.searchRange.Max,
+                barWidth,
+            )
+
+            fmt.Printf(
+                "Progress Report\n" +
+                "================\n" +
+                "Range Size (keys): %s\n" +
+                "CPU Cores Used   : %d\n" +
+                "\n" +
+                "Search Progress  : \n" +
+                "[%s] %.2f%%\n" +
+                "\n" +
+                "Keys Checked     : %d\n" +
+                "Keys/sec         : %.2f\n" +
+                "Time Elapsed     : %s\n" +
+                "Est. Time Left   : %s\n" +
+                "Current Position : %x\n" +
+                "Range Start     : %x\n" +
+                "Range End       : %x\n",
+                rangeSize.Text(10),
+                runtime.NumCPU(),
+                progressBar,
+                percentage,
+                keysChecked,
+                keysPerSecond,
+                duration.Round(time.Second),
+                time.Duration(estimatedTimeRemaining * float64(time.Second)).Round(time.Second),
+                currentPos,
+                stats.searchRange.Min,
+                stats.searchRange.Max,
+            )
+        }
     }
 }
 
 func shouldSkipKey(key *big.Int) bool {
-    hexKey := key.Text(16)
-    
-    if len(hexKey) < 4 {
+    bytes := key.Bytes()
+    if len(bytes) < 2 { // Menos de 4 chars hex
         return false
     }
 
-    count := 1
-    lastChar := hexKey[0]
-
-    for i := 1; i < len(hexKey); i++ {
-        currentChar := hexKey[i]
-        if currentChar == lastChar && currentChar != '0' {
+    var count byte = 1
+    var last byte = bytes[0] & 0xF // Pega apenas 4 bits
+    
+    for _, b := range bytes {
+        high := b >> 4  // 4 bits mais significativos
+        if high == last && high != 0 {
             count++
             if count >= 4 {
                 return true
@@ -336,18 +301,116 @@ func shouldSkipKey(key *big.Int) bool {
         } else {
             count = 1
         }
-        lastChar = currentChar
+        last = high
+
+        low := b & 0xF  // 4 bits menos significativos
+        if low == last && low != 0 {
+            count++
+            if count >= 4 {
+                return true
+            }
+        } else {
+            count = 1
+        }
+        last = low
     }
 
     return false
 }
 
 // CheckAddressWithWIF verifica se uma chave privada corresponde ao hash160 alvo
-func CheckAddressWithWIF(privateKey *big.Int, targetHash160 []byte) bool {
+func CheckAddressWithWIF(privateKey *big.Int, r Range) bool {
     privKeyBytes := privateKey.FillBytes(make([]byte, 32))
     pubKey := wif.GeneratePublicKey(privKeyBytes)
     hash160 := wif.Hash160(pubKey)
-    return bytes.Equal(hash160, targetHash160)
+    
+    // Primeiro verifica no Bloom Filter
+    if !r.Filter.Contains(hash160) {
+        return false
+    }
+    
+    // Se passar pelo Bloom Filter, faz a verificação final
+    return bytes.Equal(hash160, r.Status)
+}
+
+// Adicione esta estrutura global para manter a posição atual da bola
+type GlobalStatus struct {
+    positions      map[int]*big.Int  // map de id da thread para posição
+    currentPosition *big.Int         // mantenha isso para compatibilidade
+    mu             sync.Mutex
+}
+
+var globalStatus = GlobalStatus{
+    positions:       make(map[int]*big.Int),
+    currentPosition: new(big.Int),
+}
+
+// Função para atualizar a posição global
+func updateGlobalPosition(position *big.Int) {
+    globalStatus.mu.Lock()
+    defer globalStatus.mu.Unlock()
+    globalStatus.currentPosition.Set(position)
+    // Também atualiza o mapa de posições
+    if globalStatus.positions == nil {
+        globalStatus.positions = make(map[int]*big.Int)
+    }
+    if globalStatus.positions[0] == nil {
+        globalStatus.positions[0] = new(big.Int)
+    }
+    globalStatus.positions[0].Set(position)
+}
+
+// Função para gerar a barra visual
+func generateProgressBar(min, max *big.Int, width int) string {
+    var builder strings.Builder
+    builder.Grow(width)
+    
+    globalStatus.mu.Lock()
+    // Usa apenas a posição da thread 0
+    currentPos := new(big.Int)
+    if globalStatus.positions[0] != nil {
+        currentPos.Set(globalStatus.positions[0])
+    } else {
+        currentPos.Set(min)
+    }
+    globalStatus.mu.Unlock()
+
+    if currentPos.Cmp(min) < 0 || currentPos.Cmp(max) > 0 {
+        return strings.Repeat("-", width)
+    }
+
+    // Calcula a posição relativa usando big.Float para maior precisão
+    range_size := new(big.Float).SetInt(new(big.Int).Sub(max, min))
+    current_pos := new(big.Float).SetInt(new(big.Int).Sub(currentPos, min))
+    
+    // Calcula a posição como uma fração do range total
+    ratio := new(big.Float).Quo(current_pos, range_size)
+    floatVal, _ := ratio.Float64()
+    
+    // Calcula a posição na barra
+    position := int(floatVal * float64(width))
+
+    // Garante que a posição está dentro dos limites
+    if position >= width {
+        position = width - 1
+    }
+    if position < 0 {
+        position = 0
+    }
+
+    // Constrói a barra
+    for i := 0; i < width; i++ {
+        switch {
+        case i == position:
+            builder.WriteRune('⬤') // Bola sólida
+        case i < position:
+            builder.WriteRune('━') // Área percorrida
+        default:
+            builder.WriteRune('─') // Área não percorrida
+        }
+    }
+
+    return builder.String()
 }
 
 // SearchWorker implementa a lógica de busca para cada worker
@@ -364,14 +427,20 @@ func SearchWorker(
     
     strategy := NewJumpStrategy(startPoint)
     strategy.direction = direction
+    strategy.energyLevel = 1.0
+    strategy.lastBounce = time.Now()
     
     ball := new(big.Int).Set(startPoint)
     rangeSize := new(big.Int).Sub(r.Max, r.Min)
     currentKey := new(big.Int)
+    
+    checkBuffer := make([]*big.Int, 0, strategy.ballRange.size)
+    lastBounceTime := time.Now()
+    bounceCount := 0
 
     for {
         select {
-        case <-found:
+        case <-done:
             return
         default:
             jump := GenerateSmartJump(rangeSize, strategy)
@@ -379,41 +448,87 @@ func SearchWorker(
             if strategy.direction > 0 {
                 ball.Add(ball, jump)
                 if ball.Cmp(r.Max) > 0 {
-                    ball.Sub(r.Max, new(big.Int).Sub(ball, r.Max))
+                    excess := new(big.Int).Sub(ball, r.Max)
+                    ball.Sub(r.Max, excess)
                     strategy.direction *= -1
+                    lastBounceTime = time.Now()
+                    bounceCount++
+                    strategy.energyLevel *= (1.0 - baseEnergyLoss)
                     atomic.AddUint64(&strategy.bounceCount, 1)
                 }
             } else {
                 ball.Sub(ball, jump)
                 if ball.Cmp(r.Min) < 0 {
-                    ball.Add(r.Min, new(big.Int).Sub(r.Min, ball))
+                    deficit := new(big.Int).Sub(r.Min, ball)
+                    ball.Add(r.Min, deficit)
                     strategy.direction *= -1
+                    lastBounceTime = time.Now()
+                    bounceCount++
+                    strategy.energyLevel *= (1.0 - baseEnergyLoss)
                     atomic.AddUint64(&strategy.bounceCount, 1)
                 }
             }
 
-            stats.progressBar.updateHit(ball, r.Min)
-
+            updateGlobalPosition(ball)
+            strategy.ballRange.current.Set(ball)
+            checkBuffer = checkBuffer[:0]
+            
             currentKey.Set(ball)
+            batchSize := strategy.ballRange.size
+            atomic.AddUint64(&stats.keysChecked, uint64(batchSize)) 
+            
             for i := int64(0); i < strategy.ballRange.size; i++ {
                 if currentKey.Cmp(r.Max) > 0 || currentKey.Cmp(r.Min) < 0 {
                     break
-                }
-
-                atomic.AddUint64(&stats.keysChecked, 1)
+                } 
 
                 if !shouldSkipKey(currentKey) {
-                    if CheckAddressWithWIF(currentKey, r.Status) {
-                        found <- new(big.Int).Set(currentKey)
-                        return
-                    }
+                    checkBuffer = append(checkBuffer, new(big.Int).Set(currentKey))
                 }
-
                 currentKey.Add(currentKey, big.NewInt(1))
             }
+
+            for _, keyToCheck := range checkBuffer {
+                select {
+                case <-done:
+                    return
+                default:
+                    if CheckAddressWithWIF(keyToCheck, r) {
+                        select {
+                        case found <- new(big.Int).Set(keyToCheck):
+                            return
+                        default:
+                            return
+                        }
+                    }
+                }
+            }
+
+            timeSinceLastBounce := time.Since(lastBounceTime).Seconds()
+            strategy.height = strategy.energyLevel * math.Sin(timeSinceLastBounce*math.Pi)
+            strategy.velocity = strategy.energyLevel * (1.0 + strategy.height)
+            
+            if strategy.energyLevel < minVelocity {
+                strategy.energyLevel = minVelocity
+            }
+
+            strategy.updateCoverage(ball)
+            strategy.adjustBallRange()
+
+            momentum := float64(strategy.direction) * strategy.velocity
+            strategy.momentum = strategy.momentum*momentumFactor + momentum*(1-momentumFactor)
+
+            for i := len(strategy.lastPositions)-1; i > 0; i-- {
+                if strategy.lastPositions[i] == nil {
+                    strategy.lastPositions[i] = new(big.Int)
+                }
+                strategy.lastPositions[i].Set(strategy.lastPositions[i-1])
+            }
+            strategy.lastPositions[0].Set(ball)
         }
     }
 }
+
 
 func (js *JumpStrategy) calculateAdaptiveJump(rangeSize *big.Int) *big.Int {
     js.mu.Lock()
@@ -426,31 +541,36 @@ func (js *JumpStrategy) calculateAdaptiveJump(rangeSize *big.Int) *big.Int {
     currentSegment := new(big.Int).Div(js.ballRange.current, big.NewInt(1000000))
     localDensity := float64(js.coverage[currentSegment.String()]) / 1000.0
 
+    // Calcula o tamanho do salto baseado na energia
+    rangeSizeFloat := new(big.Float).SetInt(rangeSize)
+    jumpSize := new(big.Float).Mul(rangeSizeFloat, big.NewFloat(js.energyLevel))
+
+    // Simula a trajetória parabólica
+    timeSinceLastBounce := time.Since(js.lastBounce).Seconds()
+    heightFactor := math.Sin(timeSinceLastBounce * math.Pi)
+    js.height = js.energyLevel * heightFactor
+
+    // Ajusta o tamanho do salto baseado na altura e densidade local
     velocityAdjustment := 1.0 - (localDensity * 0.1)
     if velocityAdjustment < 0.1 {
         velocityAdjustment = 0.1
     }
 
-    targetVelocity := js.velocity * velocityAdjustment
-    js.momentum = js.momentum*momentumFactor + targetVelocity*(1-momentumFactor)
-    
-    if js.momentum < minVelocity {
-        js.momentum = minVelocity
-    } else if js.momentum > maxVelocity {
-        js.momentum = maxVelocity
-    }
+    jumpSize = new(big.Float).Mul(jumpSize, big.NewFloat(1.0+js.height))
+    jumpSize = new(big.Float).Mul(jumpSize, big.NewFloat(velocityAdjustment))
 
-    rangeSizeFloat := new(big.Float).SetInt(rangeSize)
-    jumpSize := new(big.Float).Mul(rangeSizeFloat, big.NewFloat(js.momentum))
-
+    // Adiciona um elemento de aleatoriedade
     randomness, _ := rand.Int(rand.Reader, big.NewInt(100))
     randomFactor := 1.0 + (float64(randomness.Int64()%50) - 25.0) / 1000.0
     jumpSize = new(big.Float).Mul(jumpSize, big.NewFloat(randomFactor))
 
+    // Converte para inteiro
     jumpInt, _ := jumpSize.Int(nil)
-    ballRangeSize := big.NewInt(js.ballRange.size)
-    jumpInt.Div(jumpInt, ballRangeSize)
-    jumpInt.Mul(jumpInt, ballRangeSize)
+    
+    // Garante tamanho mínimo do salto
+    if jumpInt.Cmp(big.NewInt(minBallSize)) < 0 {
+        jumpInt.SetInt64(minBallSize)
+    }
 
     return jumpInt
 }
@@ -494,47 +614,46 @@ func NewJumpStrategy(initialPosition *big.Int) *JumpStrategy {
         direction:     1,
         velocity:      initialVelocity,
         energy:        1.0,
-        momentum:      0.0,
+        momentum:      initialVelocity,
         successRate:   1.0,
         lastJump:      new(big.Int),
         lastPositions: lastPositions,
         coverage:      make(map[string]uint64),
         ballRange: BallRange{
             current: new(big.Int).Set(initialPosition),
-            size:    10000,
+            size:    defaultBallSize,
         },
+        height:        1.0,
+        energyLevel:   1.0,
+        groundTouches: 0,
+        lastBounce:    time.Now(),
     }
 }
 
 // Search implementa a busca principal
+var done = make(chan struct{}) // Adicione esta variável global
+
 func Search(r Range) {
-    numCPU := runtime.NumCPU()
     found := make(chan *big.Int, 1)
     var wg sync.WaitGroup
     
-    progressBar := NewProgressBar(r.Min, r.Max)
     stats := &Stats{
         startTime: time.Now(),
         lastSpeedUpdate: time.Now(),
-        progressBar: progressBar,
+        searchRange: r,
     }
 
     rangeSize := new(big.Int).Sub(r.Max, r.Min)
+
+    // Inicia o monitoramento de progresso em uma goroutine separada
+    progressDone := make(chan struct{})
+    go func() {
+        PrintProgress(stats)
+        close(progressDone)
+    }()
+
+    numCPU := runtime.NumCPU()*6
     
-    fmt.Print("\033[H\033[2J")
-    fmt.Printf("Range Min (hex): %s\n", r.Min.Text(16))
-    fmt.Printf("Range Max (hex): %s\n", r.Max.Text(16))
-
-    keyCount := new(big.Int).Add(
-        new(big.Int).Sub(r.Max, r.Min),
-        big.NewInt(1),
-    )
-    fmt.Printf("Range Size (keys): %s\n", keyCount.Text(10))
-    
-    fmt.Printf("Using %d CPU cores\n\n", numCPU)
-
-    go PrintProgress(stats)
-
     for i := 0; i < numCPU; i++ {
         wg.Add(1)
         
@@ -553,17 +672,24 @@ func Search(r Range) {
         go SearchWorker(i, r, startPoint, direction, stats, found, &wg)
     }
 
+    // Espera por uma chave encontrada
     foundKey := <-found
+    close(done) // Sinaliza para todas as goroutines pararem
+
+    // Limpa a tela uma última vez
+    fmt.Print("\033[H\033[2J")
+
+    // Processa a chave encontrada
     privKeyBytes := foundKey.FillBytes(make([]byte, 32))
     pubKey := wif.GeneratePublicKey(privKeyBytes)
     wifKey := wif.PrivateKeyToWIF(foundKey)
     address := wif.PublicKeyToAddress(pubKey)
     
-    // Chama a função saveFoundKeyDetails quando a chave é encontrada
     saveFoundKeyDetails(foundKey, wifKey, address)
 
-    close(found)
+    // Espera todas as goroutines terminarem
     wg.Wait()
+    close(found)
 }
 
 // saveFoundKeyDetails salva os detalhes da chave privada encontrada em um arquivo
@@ -595,11 +721,10 @@ func main() {
     }
 
     for i, r := range ranges {
-        fmt.Printf("\nSearching range %d:\n", i+1)
-        fmt.Printf("Min: %s\n", r.Min.Text(16))
-        fmt.Printf("Max: %s\n", r.Max.Text(16))
-        fmt.Printf("Target hash160: %x\n\n", r.Status)
+        // Recria o canal done para cada nova busca
+        done = make(chan struct{})
         
+        fmt.Printf("\nPING PONG range %d:\n", i+1)
         Search(r)
     }
 }
